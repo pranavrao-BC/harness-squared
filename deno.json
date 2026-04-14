@@ -1,0 +1,22 @@
+{
+  "tasks": {
+    "daemon": "deno run --allow-net --allow-read --allow-write --allow-env --allow-run --allow-sys src/daemon/main.ts",
+    "cli": "deno run --allow-net --allow-read --allow-write --allow-env --allow-run --allow-sys src/cli/main.ts",
+    "compile": "deno compile --allow-net --allow-read --allow-write --allow-env --allow-run --allow-sys --output dist/h2 src/cli/main.ts",
+    "fmt": "deno fmt",
+    "lint": "deno lint",
+    "check": "deno check src/cli/main.ts src/daemon/main.ts"
+  },
+  "imports": {
+    "@std/toml": "jsr:@std/toml@^1.0.0",
+    "@std/cli": "jsr:@std/cli@^1.0.0",
+    "@std/path": "jsr:@std/path@^1.0.0",
+    "@std/fs": "jsr:@std/fs@^1.0.0"
+  },
+  "fmt": {
+    "lineWidth": 100,
+    "indentWidth": 2,
+    "singleQuote": false
+  },
+  "lock": true
+}
