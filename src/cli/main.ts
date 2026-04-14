@@ -18,12 +18,12 @@ import { cmdExec } from "./commands/exec.ts";
 import { IpcError } from "./ipc.ts";
 import { main as daemonMain } from "../daemon/main.ts";
 
-const USAGE = `harness² (h2) — dispatch tasks from Claude Code to opencode.
+const USAGE = `harness² (h2) — dispatch tasks to executor backends (opencode, gemini-cli, ...).
 
 Usage: h2 <command> [...]
 
 Daemon:
-  start                      start the daemon and opencode serve (idempotent)
+  start                      start the daemon and executor backends (idempotent)
   stop                       stop the daemon
 
 Orchestration:

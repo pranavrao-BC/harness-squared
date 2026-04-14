@@ -1,6 +1,6 @@
 # harness² (harness-squared) — Design Spec
 
-**One-line pitch:** A small Deno daemon + CLI (`h2`) that lets Claude Code (Opus, supervisor) dispatch coding tasks to opencode (GLM/Gemini Flash/etc., executor) with the user able to observe, guide, and gate permissions mid-run.
+**One-line pitch:** A small Deno daemon + CLI (`h2`) that lets Claude Code (Opus, supervisor) dispatch coding tasks to pluggable executor backends (opencode, Gemini CLI, etc.) with the user able to observe, guide, and gate permissions mid-run.
 
 **Status:** Exploratory prototype. Goal is to answer "is Opus-plans → cheap-executor-implements worth the coordination overhead?" — not to ship a polished tool.
 
@@ -16,7 +16,6 @@
 ## 2. Non-goals for this exploration
 
 - No cost/token tracking (available via provider APIs if needed later).
-- No executor profiles / model abstraction. Hardcode GLM via z.ai in opencode config for v0.1. Generalize only if the plumbing works.
 - No parallel jobs. One delegation at a time. Multi-job comes after single-job works.
 - No persistence. Daemon holds jobs in memory. Daemon dies = jobs gone.
 - No web UI, no TUI app. CLI + tmux only.
@@ -36,19 +35,23 @@
      │   h2 CLI (one-shot)   │  ◀────▶   │   h2 daemon           │
      └───────────────────────┘  HTTP     │   (long-running)      │
                                 over     └──────────┬────────────┘
-     [ user, in a tmux pane ]  unix                │ HTTP + SSE
-              │                socket              ▼
-              │ `h2 tail <id>`, `h2 send …`  ┌──────────────────┐
-              └──────────────────────────▶   │  opencode serve  │
-                                              │  (child process) │
-                                              └──────────────────┘
-                                                       │
-                                                    z.ai GLM / others
+     [ user, in a tmux pane ]  unix                │
+              │                socket       ┌──────┴──────┐
+              │ `h2 tail <id>`, `h2 send …` │  Adapter    │ Normalized events
+              └──────────────────────────▶  │  boundary   │ Opaque session IDs
+                                           └──────┬──────┘ Unified permissions
+                                     ┌────────────┼────────────┐
+                                     ▼            ▼            ▼
+                              ┌────────────┐ ┌──────────┐ ┌──────────┐
+                              │  opencode  │ │  gemini  │ │ (future) │
+                              │  (HTTP+SSE)│ │(ACP/RPC) │ │          │
+                              └────────────┘ └──────────┘ └──────────┘
 ```
 
 - **Claude Code ↔ h2 CLI:** shell subprocess invocation, via Claude's `Bash` tool. No special integration. Each call is gated by Claude Code's normal Bash permission prompt.
 - **h2 CLI ↔ h2 daemon:** HTTP over a unix socket (use `Deno.serve({ path })`). One-shot commands that post/fetch, plus one long-lived SSE subscription for `tail`.
-- **h2 daemon ↔ opencode serve:** HTTP + SSE against opencode's documented API. Daemon owns the opencode child process lifecycle.
+- **h2 daemon ↔ ExecutorAdapter:** daemon routes each job to the configured adapter. The adapter boundary normalizes events, session IDs, and permissions across backends.
+- **ExecutorAdapter ↔ backends:** each adapter speaks its backend's native protocol (opencode: HTTP + SSE; Gemini CLI: ACP JSON-RPC over stdio; etc.). Daemon owns child process lifecycle where applicable.
 - **User ↔ h2 CLI:** user runs `h2 tail`, `h2 send`, `h2 approve` in a separate tmux pane to observe/guide jobs.
 
 ## 4. Repo layout

@@ -1,15 +1,15 @@
 // Subscribes to opencode's /event SSE stream, demultiplexes by sessionID, and
-// translates the raw events into h2-internal Events (DESIGN.md §5, §7).
+// translates the raw events into h2-internal Events.
 //
 // Designed to run as one long-lived task. Caller registers listeners per
 // sessionID. Reconnects on failure with a small backoff.
 
-import { parseSse } from "../shared/sse.ts";
-import type { Event, PermissionRequest } from "../shared/types.ts";
-import type { OcPermissionRequest } from "./opencode_client.ts";
-import { log } from "../shared/log.ts";
+import { parseSse } from "../../../shared/sse.ts";
+import type { Event, PermissionRequest } from "../../../shared/types.ts";
+import type { OcPermissionRequest } from "./client.ts";
+import { log } from "../../../shared/log.ts";
+import type { ExecutorEventHandler } from "../types.ts";
 
-export type OpencodeEventHandler = (events: Event[], raw: RawOpencodeEvent) => void;
 export type RawOpencodeEvent = { type: string; properties?: Record<string, unknown> };
 
 /** Per-session state the translator needs to filter user-vs-assistant parts. */
@@ -20,7 +20,7 @@ type SessionState = {
 
 type Listener = {
   sessionId: string;
-  handler: OpencodeEventHandler;
+  handler: ExecutorEventHandler;
 };
 
 export class OpencodeEventBridge {
@@ -40,7 +40,7 @@ export class OpencodeEventBridge {
     return s;
   }
 
-  subscribe(sessionId: string, handler: OpencodeEventHandler): () => void {
+  subscribe(sessionId: string, handler: ExecutorEventHandler): () => void {
     const l: Listener = { sessionId, handler };
     this.listeners.add(l);
     return () => this.listeners.delete(l);
@@ -101,9 +101,8 @@ export class OpencodeEventBridge {
 
   private dispatch(raw: RawOpencodeEvent) {
     const sessionId = extractSessionId(raw);
-    if (!sessionId) return; // non-session-scoped events are ignored
+    if (!sessionId) return;
 
-    // Maintain role map for this session so translate() can filter user parts.
     if (raw.type === "message.updated") {
       const info = (raw.properties as { info?: { id?: string; role?: string } } | undefined)?.info;
       if (info?.id && info.role) {
@@ -116,7 +115,7 @@ export class OpencodeEventBridge {
     for (const l of this.listeners) {
       if (l.sessionId !== sessionId) continue;
       const translated = translate(raw, l.sessionId, this.state(sessionId));
-      l.handler(translated, raw);
+      l.handler(translated, raw.type);
     }
   }
 }
@@ -124,11 +123,8 @@ export class OpencodeEventBridge {
 function extractSessionId(raw: RawOpencodeEvent): string | null {
   const p = raw.properties as Record<string, unknown> | undefined;
   if (!p) return null;
-  // Most events: properties.sessionID. For permission.asked: properties itself
-  // is the PermissionRequest, which also has sessionID.
   const direct = typeof p.sessionID === "string" ? p.sessionID : null;
   if (direct) return direct;
-  // message.updated: properties.info.sessionID
   const info = p.info as Record<string, unknown> | undefined;
   if (info && typeof info.sessionID === "string") return info.sessionID;
   return null;
@@ -170,9 +166,6 @@ export function translate(
       return [{ type: "permission.resolved", id, response }];
     }
     case "session.idle":
-      // Do not emit anything here. jobs.ts looks at rawType="session.idle" to
-      // decide whether to transition the Job to "done"; emitting an Event
-      // from here would short-circuit that logic inside the switch in jobs.ts.
       return [];
     case "session.error": {
       const err = p.error as { name?: string; data?: { message?: string } } | undefined;
@@ -180,19 +173,15 @@ export function translate(
       return [{ type: "job.error", error: msg }];
     }
     case "session.status":
-      // Noisy and redundant with Job.state transitions. Skip.
       return [];
     case "message.part.updated": {
       const part = p.part as Record<string, unknown> | undefined;
       if (!part) return [];
-      // Skip parts belonging to user messages — those would echo the task back.
       const msgId = typeof part.messageID === "string" ? part.messageID : "";
       if (state && msgId && state.userMessageIds.has(msgId)) return [];
       return partToEvents(part);
     }
     case "message.updated": {
-      // Useful only as a completion signal for the assistant message;
-      // jobs.ts decides when to declare done.
       return [];
     }
     default:
@@ -248,7 +237,6 @@ function describePermission(pr: OcPermissionRequest): string {
 }
 
 function summariseMetadata(m: Record<string, unknown>): string {
-  // Common fields we expect: command, filepath, url
   for (const k of ["command", "filepath", "path", "url", "target"]) {
     const v = m[k];
     if (typeof v === "string" && v) return `${k}=${v.length > 80 ? v.slice(0, 77) + "..." : v}`;

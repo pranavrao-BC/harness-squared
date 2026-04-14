@@ -1,35 +1,60 @@
 // Typed thin wrappers around opencode's HTTP API. Endpoints verified against
-// a live opencode 1.4.3 server (see DESIGN.md §13 Q1 — event shapes confirmed).
-//
-// Note: opencode's /doc OpenAPI only declares /global/* paths, but the session
-// endpoints below work and are documented at https://opencode.ai/docs/server/.
+// a live opencode 1.4.3 server.
 
-import type { Config } from "../shared/types.ts";
+import type { ExecutorConfig } from "../types.ts";
 
 export type OcSession = {
-  id: string;
-  slug: string;
-  version: string;
-  projectID: string;
-  directory: string;
-  title: string;
-  time: { created: number; updated: number };
+  readonly id: string;
+  readonly slug: string;
+  readonly version: string;
+  readonly projectID: string;
+  readonly directory: string;
+  readonly title: string;
+  readonly time: { readonly created: number; readonly updated: number };
 };
 
 export type OcPermissionRequest = {
-  id: string;
-  sessionID: string;
-  permission: string;
-  patterns: string[];
-  metadata: Record<string, unknown>;
-  always: string[];
-  tool?: { messageID: string; callID: string };
+  readonly id: string;
+  readonly sessionID: string;
+  readonly permission: string;
+  readonly patterns: string[];
+  readonly metadata: Record<string, unknown>;
+  readonly always: string[];
+  readonly tool?: { readonly messageID: string; readonly callID: string };
+};
+
+export type OcMessageRow = {
+  readonly info: {
+    readonly id: string;
+    readonly sessionID: string;
+    readonly role: "user" | "assistant";
+    readonly time: { readonly created: number; readonly completed?: number };
+    readonly error?: { readonly name: string; readonly data: { readonly message?: string } };
+  };
+  readonly parts: ReadonlyArray<
+    | { readonly type: "text"; readonly text: string; readonly synthetic?: boolean }
+    | { readonly type: "reasoning"; readonly text: string }
+    | { readonly type: "tool"; readonly tool: string; readonly callID: string; readonly state: unknown }
+    | { readonly type: "file"; readonly filename?: string; readonly url: string }
+    | {
+        readonly type:
+          | "step-start"
+          | "step-finish"
+          | "patch"
+          | "snapshot"
+          | "subtask"
+          | "agent"
+          | "retry"
+          | "compaction";
+        readonly [k: string]: unknown;
+      }
+  >;
 };
 
 export class OpencodeClient {
   constructor(
     private baseUrl: string,
-    private config: Config,
+    private executorConfig: ExecutorConfig,
   ) {}
 
   private async req<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -40,7 +65,7 @@ export class OpencodeClient {
     });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(`opencode ${method} ${path} → ${res.status}: ${text}`);
+      throw new Error(`opencode ${method} ${path} -> ${res.status}: ${text}`);
     }
     if (res.status === 204 || res.headers.get("content-length") === "0") {
       return {} as T;
@@ -49,7 +74,7 @@ export class OpencodeClient {
     if (!ct.includes("application/json")) {
       return {} as T;
     }
-    return await res.json() as T;
+    return (await res.json()) as T;
   }
 
   health(): Promise<unknown> {
@@ -69,15 +94,14 @@ export class OpencodeClient {
     } = {
       parts: [{ type: "text", text }],
     };
-    if (this.config.model) {
-      const parsed = parseModel(this.config.model);
+    if (this.executorConfig.model) {
+      const parsed = parseModel(this.executorConfig.model);
       if (parsed) body.model = parsed;
     }
-    if (this.config.agent) body.agent = this.config.agent;
+    if (this.executorConfig.agent) body.agent = this.executorConfig.agent;
     await this.req("POST", `/session/${sessionId}/prompt_async`, body);
   }
 
-  /** Opencode's permission endpoint expects {response: "once"|"always"|"reject"}. */
   respondPermission(
     sessionId: string,
     permId: string,
@@ -90,28 +114,10 @@ export class OpencodeClient {
     return this.req("POST", `/session/${sessionId}/abort`, {});
   }
 
-  /** Fetch full message list for a session. Used to render final assistant text. */
   listMessages(sessionId: string): Promise<OcMessageRow[]> {
     return this.req<OcMessageRow[]>("GET", `/session/${sessionId}/message`);
   }
 }
-
-export type OcMessageRow = {
-  info: {
-    id: string;
-    sessionID: string;
-    role: "user" | "assistant";
-    time: { created: number; completed?: number };
-    error?: { name: string; data: { message?: string } };
-  };
-  parts: Array<
-    | { type: "text"; text: string; synthetic?: boolean }
-    | { type: "reasoning"; text: string }
-    | { type: "tool"; tool: string; callID: string; state: unknown }
-    | { type: "file"; filename?: string; url: string }
-    | { type: "step-start" | "step-finish" | "patch" | "snapshot" | "subtask" | "agent" | "retry" | "compaction"; [k: string]: unknown }
-  >;
-};
 
 /** Parse "provider/model" or "provider/model@variant" into opencode's per-request model object. */
 function parseModel(s: string): { providerID: string; modelID: string; variant?: string } | null {

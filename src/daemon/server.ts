@@ -28,16 +28,18 @@ export function buildHandler(
         return json({ ok: true });
       }
       if (req.method === "POST" && path === "/jobs") {
-        const body = await readJson<{ task?: string }>(req);
+        const body = await readJson<{ task?: string; executor?: string }>(req);
         if (!body.task) return error(400, "task required");
-        const job = await jobs.create(body.task);
-        return json({ id: job.id, sessionId: job.sessionId, state: job.state });
+        const job = await jobs.create(body.task, body.executor);
+        return json({ id: job.id, sessionId: job.sessionId, state: job.state, executor: job.executor });
       }
       if (req.method === "GET" && path === "/jobs") {
         return json(jobs.list());
       }
       if (req.method === "POST" && path === "/plans") {
-        const body = await readJson<{ tasks?: Array<{ task: string; deps?: string[] }> }>(req);
+        const body = await readJson<{
+          tasks?: Array<{ task: string; deps?: string[]; executor?: string }>;
+        }>(req);
         if (!body.tasks || !Array.isArray(body.tasks) || body.tasks.length === 0) {
           return error(400, "tasks array required");
         }

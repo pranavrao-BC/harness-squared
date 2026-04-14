@@ -16,10 +16,18 @@ type HistoryEntry = {
   finishedAt: string;
 };
 
+type DelegateOpts = { executor?: string };
+type RunOpts = { executor?: string; full?: boolean };
+
 function buildH2Api() {
   return {
-    async delegate(task: string): Promise<string> {
-      const res = await ipcPost<{ id: string }>("/jobs", { task });
+    /** Standard suffix appended by delegate/run to tell the executor about escalation. */
+    ESCALATE_INSTRUCTION: `\n\nIf you discover anything the orchestrator should know — breaking changes, missing dependencies, design concerns, ambiguities, or blockers — include it in your response prefixed with [ESCALATE]. Example: "[ESCALATE] The Job type is missing a planId field needed for dependency tracking." These will be surfaced to the orchestrator before the rest of the log.`,
+
+    async delegate(task: string, opts?: DelegateOpts): Promise<string> {
+      const body: Record<string, unknown> = { task: task + this.ESCALATE_INSTRUCTION };
+      if (opts?.executor) body.executor = opts.executor;
+      const res = await ipcPost<{ id: string }>("/jobs", body);
       return res.id;
     },
 
@@ -61,7 +69,9 @@ function buildH2Api() {
       return await ipcGet<Job>(`/jobs/${id}`);
     },
 
-    async plan(tasks: Array<{ task: string; deps?: (string | number)[] }>): Promise<{ planId: string; jobIds: string[] }> {
+    async plan(
+      tasks: Array<{ task: string; deps?: (string | number)[]; executor?: string }>,
+    ): Promise<{ planId: string; jobIds: string[] }> {
       const res = await ipcPost<Plan>("/plans", { tasks });
       return { planId: res.id, jobIds: res.jobIds };
     },
@@ -71,10 +81,10 @@ function buildH2Api() {
     },
 
     /** Delegate + wait + output in one shot. Convenience for simple tasks. */
-    async run(task: string, opts?: { full?: boolean }): Promise<string> {
-      const id = await this.delegate(task);
+    async run(task: string, opts?: RunOpts): Promise<string> {
+      const id = await this.delegate(task, { executor: opts?.executor });
       await this.wait(id);
-      return await this.output(id, opts);
+      return await this.output(id, { full: opts?.full });
     },
   };
 }

@@ -1,11 +1,13 @@
-// Job lifecycle + in-memory store. Glues opencode sessions to h2 Jobs,
-// bridges opencode events to per-job event hubs, and decides when a Job
+// Job lifecycle + in-memory store. Glues executor sessions to h2 Jobs,
+// bridges executor events to per-job event hubs, and decides when a Job
 // transitions to `done`/`error`.
+//
+// Backend-agnostic: depends only on the ExecutorAdapter interface, never on
+// opencode/gemini specifics.
 
 import type { Config, Event, Job, JobState, Plan, PermissionResponse } from "../shared/types.ts";
+import type { ExecutorAdapter, NormalizedMessage, NormalizedPart } from "./executor/types.ts";
 import { log } from "../shared/log.ts";
-import { OpencodeClient, type OcMessageRow } from "./opencode_client.ts";
-import { OpencodeEventBridge } from "./opencode_events.ts";
 import { JobEventHub } from "./events.ts";
 import { PermissionStore } from "./permissions.ts";
 import { appendHistory } from "./history.ts";
@@ -20,16 +22,16 @@ export class JobManager {
   private hubs = new Map<string, JobEventHub>();
   private unsubscribers = new Map<string, () => void>();
   private finalBuffers = new Map<string, string>();
+  private jobAdapters = new Map<string, ExecutorAdapter>();
   private dispatchTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private config: Config,
-    private client: OpencodeClient,
-    private bridge: OpencodeEventBridge,
+    private adapters: ReadonlyMap<string, ExecutorAdapter>,
     public permissions: PermissionStore,
   ) {}
 
-  /** Start the Symphony-style dispatch loop. Called once on daemon boot. */
+  /** Start the dispatch loop. Called once on daemon boot. */
   startDispatchLoop() {
     if (this.dispatchTimer) return;
     this.dispatchTimer = setInterval(() => this.tick(), DISPATCH_INTERVAL_MS);
@@ -65,26 +67,38 @@ export class JobManager {
     });
   }
 
+  private resolveAdapter(executorName?: string): ExecutorAdapter {
+    const name = executorName ?? this.config.defaultExecutor;
+    const adapter = this.adapters.get(name);
+    if (!adapter) throw new Error(`unknown executor: ${name}`);
+    return adapter;
+  }
+
   /** Dispatch a pending job: create session, subscribe to events, fire prompt. */
   private async dispatch(id: string) {
     const job = this.jobs.get(id);
-    if (!job) return;
-    log.info("dispatch", { id, task: firstLine(job.task, 60) });
+    if (!job || job.state !== "pending") return;
+    const adapter = this.resolveAdapter(job.executor);
+    // Mark running immediately so the next tick doesn't double-dispatch.
+    this.mergeJob(id, { state: "running", updatedAt: new Date().toISOString() });
+    log.info("dispatch", { id, executor: adapter.name, task: firstLine(job.task, 60) });
     try {
-      const session = await this.client.createSession(firstLine(job.task, 60));
-      this.mergeJob(id, { sessionId: session.id });
+      const sessionId = await adapter.createSession(firstLine(job.task, 60));
+      this.mergeJob(id, { sessionId });
+      this.jobAdapters.set(id, adapter);
 
       const hub = new JobEventHub();
       this.hubs.set(id, hub);
 
-      const unsub = this.bridge.subscribe(session.id, (events, raw) => {
-        for (const ev of events) this.handleEvent(id, ev, raw.type);
-        this.handleRaw(id, raw.type);
+      const unsub = adapter.subscribe(sessionId, (events, rawType) => {
+        for (const ev of events) this.handleEvent(id, ev, rawType);
+        this.handleRaw(id, adapter, rawType);
       });
       this.unsubscribers.set(id, unsub);
 
-      await this.client.promptAsync(session.id, job.task);
-      this.setState(id, "running");
+      await adapter.prompt(sessionId, job.task);
+      // State already set to "running" above; publish the status event for subscribers.
+      this.hubs.get(id)?.publish({ type: "status", state: "running" });
     } catch (e) {
       log.error("dispatch failed", { id, err: String(e) });
       this.mergeJob(id, { state: "error", error: String(e), updatedAt: new Date().toISOString() });
@@ -103,12 +117,13 @@ export class JobManager {
     return this.hubs.get(id);
   }
 
-  /** Create a single job and dispatch it immediately (the original h2 delegate path). */
-  async create(task: string): Promise<Job> {
+  /** Create a single job and dispatch it immediately. */
+  async create(task: string, executor?: string): Promise<Job> {
     const job: Job = {
       id: jobId(),
       task,
       sessionId: "", // filled by dispatch
+      executor: executor ?? this.config.defaultExecutor,
       state: "pending",
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -118,11 +133,11 @@ export class JobManager {
     return this.jobs.get(job.id)!;
   }
 
-  /** Create a plan: N jobs with optional dependency edges. Jobs start in "pending"
-   *  and the dispatch loop picks them up as deps clear. */
-  createPlan(tasks: Array<{ task: string; deps?: string[] }>): Plan {
+  /** Create a plan: N jobs with optional dependency edges. */
+  createPlan(
+    tasks: Array<{ task: string; deps?: string[]; executor?: string }>,
+  ): Plan {
     const planId = "plan_" + crypto.randomUUID().replaceAll("-", "").slice(0, 12);
-    // First pass: create all jobs so we can map local indices to job IDs.
     const localIds: string[] = [];
     for (const t of tasks) {
       const id = jobId();
@@ -131,6 +146,7 @@ export class JobManager {
         id,
         task: t.task,
         sessionId: "",
+        executor: t.executor ?? this.config.defaultExecutor,
         state: "pending",
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
@@ -138,13 +154,12 @@ export class JobManager {
       };
       this.jobs.set(id, job);
     }
-    // Second pass: wire up deps. Deps reference indices (0-based) into the tasks array.
     for (let i = 0; i < tasks.length; i++) {
       const depIndices = tasks[i].deps ?? [];
       const depIds = depIndices
         .map((d) => {
           const idx = typeof d === "number" ? d : parseInt(d, 10);
-          return isNaN(idx) ? d : localIds[idx]; // support both index and raw job id
+          return isNaN(idx) ? d : localIds[idx];
         })
         .filter(Boolean) as string[];
       if (depIds.length > 0) {
@@ -171,7 +186,6 @@ export class JobManager {
 
     switch (ev.type) {
       case "permission.request": {
-        // Fix jobId — bridge doesn't know h2 ids, it stamped sessionId.
         const req = { ...ev.request, jobId };
         this.permissions.record(jobId, req);
         hub.publish({ type: "permission.request", request: req });
@@ -188,17 +202,10 @@ export class JobManager {
         return;
       }
       case "assistant.delta": {
-        const prev = this.finalBuffers.get(jobId) ?? "";
-        // Strategy: keep the latest text per partId by appending the full part
-        // text each time (message.part.updated sends cumulative text). We
-        // de-dup by tracking a map from partId→text and recomputing buffer.
         const store = this.partStore(jobId);
         store.set(ev.partId, ev.text);
         this.finalBuffers.set(jobId, [...store.values()].join("\n\n"));
-        // Pass through to subscribers with the delta-ish semantics.
         hub.publish(ev);
-        // `prev` unused, just keeping intent visible.
-        void prev;
         return;
       }
       case "tool.use":
@@ -214,39 +221,28 @@ export class JobManager {
         hub.publish({ type: "status", state });
         hub.publish(ev);
         appendHistory(this.jobs.get(jobId)!);
-        // Do NOT teardown. Error is a state, not a grave — the user may
-        // resume the session via `h2 send`, and we need to keep listening
-        // for subsequent opencode events (session.idle, new parts, etc.).
         return;
       }
       case "job.done":
-        // We synthesise this below rather than receiving from bridge.
         return;
       case "log":
         hub.publish(ev);
         return;
     }
-
   }
 
-  /** Called for every raw opencode event on the subscribed session, after
-   *  translated events have been handled. Handles two transitions:
-   *  1. session.idle → mark job done (if running)
-   *  2. session.status busy → re-activate a finished/errored job (user continued in TUI)
-   */
-  private handleRaw(jobId: string, rawType: string) {
+  /** Called for every raw executor event. Uses adapter's signal declarations
+   *  to decide state transitions (backend-agnostic). */
+  private handleRaw(jobId: string, adapter: ExecutorAdapter, rawType: string) {
     const j = this.jobs.get(jobId);
     if (!j) return;
     const hub = this.hubs.get(jobId);
 
     // Re-activate: if we see activity on a terminal job, the user continued
     // the session outside of h2. Flip back to running.
-    if (rawType === "session.status") {
+    if (adapter.activeSignals.includes(rawType)) {
       if ((j.state === "done" || j.state === "error" || j.state === "stopped") && hub) {
-        // We can't easily inspect the status payload here (it was already
-        // consumed by translate), but any session.status on a terminal job
-        // means opencode is doing something. Mark running.
-        hub.clearBuffer(); // Flush stale terminal events so new wait() calls don't see old "done"
+        hub.clearBuffer();
         this.mergeJob(jobId, { state: "running", error: undefined, updatedAt: new Date().toISOString() });
         hub.publish({ type: "status", state: "running" });
         log.info("job re-activated by session activity", { jobId });
@@ -254,7 +250,7 @@ export class JobManager {
       return;
     }
 
-    if (rawType !== "session.idle") return;
+    if (!adapter.idleSignals.includes(rawType)) return;
     if (j.state !== "running") return;
     if (!hub) return;
     const finalOutput = this.finalBuffers.get(jobId) ?? "";
@@ -266,8 +262,6 @@ export class JobManager {
     hub.publish({ type: "status", state: "done" });
     hub.publish({ type: "job.done", summary: firstLine(finalOutput, 120) });
     appendHistory(this.jobs.get(jobId)!, firstLine(finalOutput, 200));
-    // Do NOT teardown — user may continue the session via opencode TUI/web,
-    // and we want to stay subscribed so the job re-activates.
   }
 
   private partBuffers = new Map<string, Map<string, string>>();
@@ -295,17 +289,16 @@ export class JobManager {
   async sendMessage(id: string, content: string): Promise<void> {
     const j = this.jobs.get(id);
     if (!j) throw new Error("no such job");
-    // Allow send on ANY state — done/error/stopped all re-activate the session.
-    // Re-subscribe if we previously tore down (e.g. abort).
+    const adapter = this.jobAdapters.get(id) ?? this.resolveAdapter(j.executor);
     if (!this.unsubscribers.has(id)) {
-      const unsub = this.bridge.subscribe(j.sessionId, (events, raw) => {
-        for (const ev of events) this.handleEvent(id, ev, raw.type);
-        this.handleRaw(id, raw.type);
+      const unsub = adapter.subscribe(j.sessionId, (events, rawType) => {
+        for (const ev of events) this.handleEvent(id, ev, rawType);
+        this.handleRaw(id, adapter, rawType);
       });
       this.unsubscribers.set(id, unsub);
     }
-    await this.client.promptAsync(j.sessionId, content);
-    this.hubs.get(id)?.clearBuffer(); // Flush stale events for clean wait()
+    await adapter.prompt(j.sessionId, content);
+    this.hubs.get(id)?.clearBuffer();
     this.mergeJob(id, { error: undefined });
     this.setState(id, "running");
   }
@@ -313,14 +306,19 @@ export class JobManager {
   async respondPermission(id: string, permId: string, response: PermissionResponse): Promise<void> {
     const j = this.jobs.get(id);
     if (!j) throw new Error("no such job");
-    await this.client.respondPermission(j.sessionId, permId, response);
-    // The opencode server will emit permission.replied; handleEvent will mark resolved.
+    const adapter = this.jobAdapters.get(id) ?? this.resolveAdapter(j.executor);
+    await adapter.respondPermission(j.sessionId, permId, response);
+    // Mark resolved immediately. Opencode also emits permission.replied which
+    // would double-resolve via handleEvent, but that's harmless.
+    this.permissions.resolve(id, permId, response);
+    this.hubs.get(id)?.publish({ type: "permission.resolved", id: permId, response });
   }
 
   async abort(id: string): Promise<void> {
     const j = this.jobs.get(id);
     if (!j) throw new Error("no such job");
-    await this.client.abortSession(j.sessionId);
+    const adapter = this.jobAdapters.get(id) ?? this.resolveAdapter(j.executor);
+    await adapter.abort(j.sessionId);
     this.mergeJob(id, { state: "stopped", updatedAt: new Date().toISOString() });
     this.hubs.get(id)?.publish({ type: "status", state: "stopped" });
     this.teardown(id);
@@ -334,17 +332,19 @@ export class JobManager {
     }
   }
 
-  /** Condensed conversation log for the orchestrator. Includes user messages
-   *  (showing mid-run steering), tool calls, errors, and final assistant text. */
+  /** Condensed conversation log for the orchestrator. */
   async sessionLog(id: string, full = false): Promise<string | null> {
     const j = this.jobs.get(id);
     if (!j) return null;
+    const adapter = this.jobAdapters.get(id) ?? this.resolveAdapter(j.executor);
     try {
-      const msgs = await this.client.listMessages(j.sessionId);
-      return renderSessionLog(msgs, full);
+      const msgs = await adapter.listMessages(j.sessionId);
+      if (msgs.length > 0) return renderSessionLog(msgs, full);
+      // No messages from adapter — use buffered output from events
+      return this.finalBuffers.get(id) ?? j.finalOutput ?? null;
     } catch (e) {
       log.warn("jobs: sessionLog fetch failed", { err: String(e) });
-      return this.finalBuffers.get(id) ?? null;
+      return this.finalBuffers.get(id) ?? j.finalOutput ?? null;
     }
   }
 }
@@ -355,14 +355,14 @@ function jobId(): string {
 
 function firstLine(s: string, max: number): string {
   const line = s.split("\n")[0] ?? "";
-  return line.length > max ? line.slice(0, max - 1) + "…" : line;
+  return line.length > max ? line.slice(0, max - 1) + "\u2026" : line;
 }
 
-function renderSessionLog(msgs: OcMessageRow[], full: boolean): string {
+/** Render a normalised message list into the condensed log format. */
+function renderSessionLog(msgs: readonly NormalizedMessage[], full: boolean): string {
   const lines: string[] = [];
   for (const msg of msgs) {
-    const role = msg.info.role;
-    const err = msg.info.error;
+    const role = msg.role;
     for (const part of msg.parts) {
       switch (part.type) {
         case "text": {
@@ -373,25 +373,16 @@ function renderSessionLog(msgs: OcMessageRow[], full: boolean): string {
           break;
         }
         case "tool": {
-          const t = part as { tool: string; callID: string; state: unknown };
-          const st = t.state as Record<string, unknown> | undefined;
-          const status = st && typeof st === "object" && "status" in st
-            ? String((st as { status: unknown }).status)
-            : undefined;
-          if (status === "completed") {
-            if (full && st && "output" in st) {
-              lines.push(`[tool ✓] ${t.tool} → ${truncate(String((st as { output: unknown }).output), 120)}`);
+          if (part.status === "completed") {
+            if (full && part.output !== undefined) {
+              lines.push(`[tool \u2713] ${part.tool} \u2192 ${truncate(String(part.output), 120)}`);
             } else {
-              lines.push(`[tool ✓] ${t.tool}`);
+              lines.push(`[tool \u2713] ${part.tool}`);
             }
-          } else if (status === "error") {
-            const e = st && "error" in st ? String((st as { error: unknown }).error) : "";
-            lines.push(`[tool ✗] ${t.tool} ${truncate(e, 80)}`);
-          } else if (status === "running" || !status) {
-            // In-progress or pending — show the tool name + input summary in full mode.
-            if (full && st && "input" in st) {
-              lines.push(`[tool] ${t.tool} ${truncate(JSON.stringify((st as { input: unknown }).input), 100)}`);
-            }
+          } else if (part.status === "error") {
+            lines.push(`[tool \u2717] ${part.tool} ${truncate(part.error ?? "", 80)}`);
+          } else if (full && part.input !== undefined) {
+            lines.push(`[tool] ${part.tool} ${truncate(JSON.stringify(part.input), 100)}`);
           }
           break;
         }
@@ -399,14 +390,24 @@ function renderSessionLog(msgs: OcMessageRow[], full: boolean): string {
           break;
       }
     }
-    if (err) {
-      lines.push(`[error] ${err.name}: ${err.data?.message ?? ""}`);
+    if (msg.error) {
+      lines.push(`[error] ${msg.error}`);
     }
   }
-  return lines.join("\n");
+  // Hoist [ESCALATE] blocks to the top.
+  const escalations: string[] = [];
+  const rest: string[] = [];
+  for (const line of lines) {
+    if (/\[ESCALATE\]/i.test(line)) escalations.push(line);
+    else rest.push(line);
+  }
+  if (escalations.length > 0) {
+    return ["--- ESCALATIONS ---", ...escalations, "--- LOG ---", ...rest].join("\n");
+  }
+  return rest.join("\n");
 }
 
 function truncate(s: string, max: number): string {
   if (s.length <= max) return s;
-  return s.slice(0, max - 1) + "…";
+  return s.slice(0, max - 1) + "\u2026";
 }

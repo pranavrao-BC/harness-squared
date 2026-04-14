@@ -1,8 +1,8 @@
 // Spawns and owns the `opencode serve` child. Parses the bind line from its
 // stdout to learn the port it picked.
 
-import { log } from "../shared/log.ts";
-import type { Config } from "../shared/types.ts";
+import { log } from "../../../shared/log.ts";
+import type { ExecutorConfig } from "../types.ts";
 
 export type OpencodeProcess = {
   pid: number;
@@ -11,10 +11,10 @@ export type OpencodeProcess = {
   stop: () => Promise<void>;
 };
 
-export async function startOpencode(config: Config): Promise<OpencodeProcess> {
-  const args = ["serve", "--hostname", "127.0.0.1", "--port", "0", ...config.opencodeArgs];
-  log.info("opencode_process: spawning", { bin: config.opencodeBin, args });
-  const cmd = new Deno.Command(config.opencodeBin, {
+export async function startOpencode(ec: ExecutorConfig): Promise<OpencodeProcess> {
+  const args = ["serve", "--hostname", "127.0.0.1", "--port", "0", ...ec.args];
+  log.info("opencode_process: spawning", { bin: ec.bin, args });
+  const cmd = new Deno.Command(ec.bin, {
     args,
     stdin: "null",
     stdout: "piped",
@@ -56,7 +56,6 @@ export async function startOpencode(config: Config): Promise<OpencodeProcess> {
 
 /** Reads the child's stdout until we see a "opencode server listening on http://host:port" line. */
 async function waitForPort(stdout: ReadableStream<Uint8Array>): Promise<number> {
-  // We need to peek at stdout without closing it — use a teeing reader.
   const reader = stdout.getReader();
   const dec = new TextDecoder();
   let buf = "";
@@ -68,9 +67,7 @@ async function waitForPort(stdout: ReadableStream<Uint8Array>): Promise<number> 
     const m = buf.match(/http:\/\/(?:127\.0\.0\.1|localhost):(\d+)/);
     if (m) {
       reader.releaseLock();
-      // Log anything we have so far.
       log.debug("opencode.stdout", { early: buf.slice(0, 400) });
-      // Put remaining bytes + future stream back into the logger in consumeTo.
       return Number(m[1]);
     }
   }

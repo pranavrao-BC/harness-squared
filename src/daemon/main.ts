@@ -1,16 +1,15 @@
 // Daemon entrypoint. Boots:
-//   1) opencode serve child (owns port)
-//   2) opencode event bridge (SSE subscriber)
-//   3) JobManager + PermissionStore
-//   4) HTTP server over unix socket
+//   1) Executor adapter(s) via factory
+//   2) JobManager + PermissionStore
+//   3) HTTP server over unix socket
 
 import { ensureDir } from "@std/fs";
 import { dirname } from "@std/path";
 import { loadConfig } from "../config.ts";
 import { log } from "../shared/log.ts";
-import { startOpencode } from "./opencode_process.ts";
-import { OpencodeClient } from "./opencode_client.ts";
-import { OpencodeEventBridge } from "./opencode_events.ts";
+import { createAdapters } from "./executor/factory.ts";
+import type { ExecutorAdapter } from "./executor/types.ts";
+import { OpencodeAdapter } from "./executor/opencode/adapter.ts";
 import { PermissionStore } from "./permissions.ts";
 import { JobManager } from "./jobs.ts";
 import { buildHandler } from "./server.ts";
@@ -28,23 +27,20 @@ export async function main() {
   }
   await ensureDir(dirname(config.socketPath));
 
-  const oc = await startOpencode(config);
-  const client = new OpencodeClient(oc.baseUrl, config);
-  await client.health().catch((e) => {
-    log.warn("daemon: opencode health check failed", { err: String(e) });
-  });
-
-  const bridge = new OpencodeEventBridge(oc.baseUrl);
-  bridge.start();
+  const adapters = await createAdapters(config);
 
   const permissions = new PermissionStore();
-  const jobs = new JobManager(config, client, bridge, permissions);
+  const jobs = new JobManager(config, adapters, permissions);
   jobs.startDispatchLoop();
 
-  await Deno.writeTextFile(
-    config.pidPath,
-    JSON.stringify({ daemon: Deno.pid, opencode: oc.pid, opencodePort: oc.port }, null, 2),
-  );
+  // Write pid file — include opencode process info if available for backward compat.
+  const pidInfo: Record<string, unknown> = { daemon: Deno.pid };
+  const ocAdapter = adapters.get("opencode");
+  if (ocAdapter instanceof OpencodeAdapter && ocAdapter.processInfo) {
+    pidInfo.opencode = ocAdapter.processInfo.pid;
+    pidInfo.opencodePort = ocAdapter.processInfo.port;
+  }
+  await Deno.writeTextFile(config.pidPath, JSON.stringify(pidInfo, null, 2));
 
   let shuttingDown = false;
   let server: Deno.HttpServer | null = null;
@@ -55,8 +51,11 @@ export async function main() {
     log.info("daemon: shutting down", { reason });
     try {
       jobs.stopDispatchLoop();
-      bridge.stop();
-      await oc.stop();
+      const stopPromises: Promise<void>[] = [];
+      for (const adapter of adapters.values()) {
+        stopPromises.push(adapter.stop());
+      }
+      await Promise.allSettled(stopPromises);
       await server?.shutdown();
       try {
         await Deno.remove(config.socketPath);
@@ -92,9 +91,6 @@ export async function main() {
   await server.finished;
 }
 
-// Only auto-boot when run directly (deno run src/daemon/main.ts), not when
-// imported by the CLI binary. In compiled binaries, import.meta.main is only
-// true for the actual entrypoint (cli/main.ts), not imported modules.
 const isDirectRun = import.meta.main &&
   new URL(import.meta.url).pathname.endsWith("daemon/main.ts");
 if (isDirectRun) {

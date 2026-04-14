@@ -1,12 +1,16 @@
 # harness²
 
-Claude Code (Opus) delegates coding tasks to opencode (GLM, Gemini Flash, etc.) via a Deno daemon. You watch and approve permissions in a separate pane.
+Claude Code (Opus) delegates coding tasks to pluggable executor backends (opencode, Gemini CLI, ...) via a Deno daemon. You watch and approve permissions in a separate pane.
 
 ```
-Claude Code  ──h2 exec──▶  h2 daemon  ──HTTP──▶  opencode serve  ──▶  GLM / etc.
-                                ▲
-                                │  h2 tail / approve
-                                you (tmux pane)
+CLI (h2)  ──unix socket──▶  daemon  ──▶  ExecutorAdapter  ──▶  { opencode | gemini-cli | ... }
+                                       ┌──────────┐
+                                       │ Adapter  │  Normalized events, opaque session IDs
+                                       │ boundary │  Unified permission handling
+                                       └──────────┘
+                                               ▲
+                                               │  h2 tail / approve
+                                               you (tmux pane)
 ```
 
 ## Install
@@ -22,12 +26,20 @@ cd harness-squared
 
 ## Setup
 
-1. Optional — set which model opencode uses:
+1. Configure executors:
 
 ```bash
 mkdir -p ~/.config/harness-squared
-echo '[opencode]
-model = "zai-coding-plan/glm-5.1"' > ~/.config/harness-squared/config.toml
+cat > ~/.config/harness-squared/config.toml << 'EOF'
+executor = "opencode"             # default executor for new jobs
+
+[opencode]
+model = "zai-coding-plan/glm-5.1"
+
+[gemini]
+bin = "gemini"
+model = "gemini-3-flash"
+EOF
 ```
 
 2. Tell Claude Code about h2:
@@ -72,7 +84,7 @@ h2 tail <job-id>
 
 Permission prompts appear here. Press `y` to allow, `a` for always, `n` to deny.
 
-Or use the opencode TUI/web UI directly:
+Or attach to a specific executor's native UI (opencode only):
 ```bash
 opencode attach http://127.0.0.1:$(cat ~/.harness-squared/pids.json | grep opencodePort | grep -o '[0-9]*')
 ```
@@ -88,8 +100,8 @@ Claude writes JS scripts against these functions:
 
 | Function | What it does |
 |---|---|
-| `h2.run(task)` | Delegate + wait + return session log. One call. |
-| `h2.delegate(task)` | Create a job, return its id. |
+| `h2.run(task, opts?)` | Delegate + wait + return session log. One call. |
+| `h2.delegate(task, opts?)` | Create a job, return its id. |
 | `h2.wait(id)` | Block until job finishes. |
 | `h2.output(id)` | Session log: user msgs, tool calls, errors, final text. |
 | `h2.send(id, msg)` | Send guidance mid-run, or resume an errored job. |
@@ -97,6 +109,8 @@ Claude writes JS scripts against these functions:
 | `h2.status(id)` | Get current job state. |
 | `h2.plan(tasks)` | Create multiple jobs with dependency graph. |
 | `h2.history(n)` | Past jobs (persists across daemon restarts). |
+
+`opts` can include `{ executor: "gemini" }` to route a task to a specific backend. Without it, the default from config is used.
 
 Use `Promise.all` for parallel tasks. Pass output of one task into the next with string interpolation. Standard JS — Claude knows how to write it.
 
@@ -118,16 +132,33 @@ Use `Promise.all` for parallel tasks. Pass output of one task into the next with
 ## How it works
 
 1. `h2 exec` runs a JS script in-process with the `h2` API object injected.
-2. `h2.delegate()` POSTs to the daemon, which creates an opencode session and fires `prompt_async`.
-3. The daemon subscribes to opencode's SSE stream and translates events (tool calls, permissions, completion) into per-job event hubs.
+2. `h2.delegate()` POSTs to the daemon, which picks the configured executor adapter and creates a session.
+3. The adapter translates backend-specific events (tool calls, permissions, completion) into h2's normalized event format and publishes them to a per-job event hub.
 4. `h2.wait()` subscribes to the daemon's SSE for that job and blocks until terminal.
-5. Permission requests bubble up to `h2 tail`. Approvals flow back through the daemon to opencode.
-6. `h2.output()` fetches the full message history from opencode and renders a condensed log.
-7. Jobs re-activate if the user continues the session via opencode TUI or `h2.send()`.
+5. Permission requests from any backend bubble up to `h2 tail`. Approvals flow back through the daemon to the executor.
+6. `h2.output()` fetches the normalized message history and renders a condensed log.
+7. Jobs re-activate if the user continues the session via `h2.send()` or the executor's native UI.
+
+## Executor backends
+
+### opencode
+
+Spawns `opencode serve` as a child process. Communicates via HTTP + SSE. Supports the `opencode attach` TUI for direct inspection.
+
+### Gemini CLI
+
+Uses [ACP (Agent Client Protocol)](https://agentclientprotocol.com) — JSON-RPC 2.0 over stdio. The daemon spawns `gemini --acp` and communicates bidirectionally: requests to Gemini for prompting/sessions, and Gemini sends back notifications (streaming chunks, tool calls, permission requests). No HTTP involved.
+
+Per-task routing:
+```js
+await h2.run("refactor utils.ts", { executor: "gemini" })
+```
 
 ## Notes
 
-- Use **absolute paths** in task descriptions. Opencode sessions inherit the daemon's cwd.
+- Use **absolute paths** in task descriptions. Executor sessions inherit the daemon's cwd.
+- Route tasks to specific backends with `{ executor: "gemini" }` or let them use the default from config.
+- In `h2.plan()`, each task object can include `executor` to mix backends in one plan.
 - Jobs survive errors. `h2.send(id, "continue")` resumes. No subscription teardown.
 - History persists to `~/.harness-squared/history.jsonl`. Daemon restarts lose in-flight jobs but history stays.
 - The plan system (via `h2.plan()`) auto-dispatches tasks as dependencies clear, up to 3 concurrent.
@@ -137,13 +168,20 @@ Use `Promise.all` for parallel tasks. Pass output of one task into the next with
 `~/.config/harness-squared/config.toml`:
 
 ```toml
+executor = "opencode"                  # default executor for new jobs
+
 [opencode]
-model = "zai-coding-plan/glm-5.1"   # provider/model per session
-# bin = "opencode"                   # opencode binary path
-# args = []                          # extra args to opencode serve
+model = "zai-coding-plan/glm-5.1"     # provider/model per session
+# bin = "opencode"                     # opencode binary path
+# args = []                            # extra args to opencode serve
+
+[gemini]
+bin = "gemini"                         # gemini binary path
+model = "gemini-3-flash"               # model name
+# args = []                            # extra args to gemini --acp
 
 [permissions]
-# default = "wait"                   # "wait", "deny", or "allow"
+# default = "wait"                     # "wait", "deny", or "allow"
 
 [daemon]
 # socket = "~/.harness-squared/daemon.sock"
