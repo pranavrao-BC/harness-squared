@@ -2,6 +2,7 @@
 
 import type { Config, Event, PermissionResponse } from "../shared/types.ts";
 import type { JobManager } from "./jobs.ts";
+import { readHistory } from "./history.ts";
 import { encodeSseFrame } from "../shared/sse.ts";
 import { log } from "../shared/log.ts";
 
@@ -17,6 +18,11 @@ export function buildHandler(
       if (req.method === "GET" && path === "/health") {
         return json({ ok: true, pid: Deno.pid });
       }
+      if (req.method === "GET" && path === "/history") {
+        const limit = parseInt(url.searchParams.get("limit") ?? "50", 10);
+        const entries = await readHistory(limit);
+        return json(entries);
+      }
       if (req.method === "POST" && path === "/shutdown") {
         queueMicrotask(onShutdown);
         return json({ ok: true });
@@ -29,6 +35,26 @@ export function buildHandler(
       }
       if (req.method === "GET" && path === "/jobs") {
         return json(jobs.list());
+      }
+      if (req.method === "POST" && path === "/plans") {
+        const body = await readJson<{ tasks?: Array<{ task: string; deps?: string[] }> }>(req);
+        if (!body.tasks || !Array.isArray(body.tasks) || body.tasks.length === 0) {
+          return error(400, "tasks array required");
+        }
+        const plan = jobs.createPlan(body.tasks);
+        return json(plan);
+      }
+      if (req.method === "GET" && path === "/plans") {
+        return json(jobs.listPlans());
+      }
+      {
+        const planMatch = path.match(/^\/plans\/([^/]+)$/);
+        if (req.method === "GET" && planMatch) {
+          const plan = jobs.getPlan(planMatch[1]);
+          if (!plan) return error(404, "no such plan");
+          const planJobs = plan.jobIds.map((id) => jobs.get(id)).filter(Boolean);
+          return json({ ...plan, jobs: planJobs });
+        }
       }
 
       const m = path.match(/^\/jobs\/([^/]+)(\/.*)?$/);

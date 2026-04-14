@@ -39,6 +39,7 @@ export async function main() {
 
   const permissions = new PermissionStore();
   const jobs = new JobManager(config, client, bridge, permissions);
+  jobs.startDispatchLoop();
 
   await Deno.writeTextFile(
     config.pidPath,
@@ -53,6 +54,7 @@ export async function main() {
     shuttingDown = true;
     log.info("daemon: shutting down", { reason });
     try {
+      jobs.stopDispatchLoop();
       bridge.stop();
       await oc.stop();
       await server?.shutdown();

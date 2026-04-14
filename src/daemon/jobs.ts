@@ -2,18 +2,25 @@
 // bridges opencode events to per-job event hubs, and decides when a Job
 // transitions to `done`/`error`.
 
-import type { Config, Event, Job, JobState, PermissionResponse } from "../shared/types.ts";
+import type { Config, Event, Job, JobState, Plan, PermissionResponse } from "../shared/types.ts";
 import { log } from "../shared/log.ts";
 import { OpencodeClient, type OcMessageRow } from "./opencode_client.ts";
 import { OpencodeEventBridge } from "./opencode_events.ts";
 import { JobEventHub } from "./events.ts";
 import { PermissionStore } from "./permissions.ts";
+import { appendHistory } from "./history.ts";
+export { readHistory, type HistoryEntry } from "./history.ts";
+
+const MAX_CONCURRENT = 3;
+const DISPATCH_INTERVAL_MS = 2000;
 
 export class JobManager {
   private jobs = new Map<string, Job>();
+  private plans = new Map<string, Plan>();
   private hubs = new Map<string, JobEventHub>();
   private unsubscribers = new Map<string, () => void>();
-  private finalBuffers = new Map<string, string>(); // assistant text accumulator per job
+  private finalBuffers = new Map<string, string>();
+  private dispatchTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private config: Config,
@@ -21,6 +28,68 @@ export class JobManager {
     private bridge: OpencodeEventBridge,
     public permissions: PermissionStore,
   ) {}
+
+  /** Start the Symphony-style dispatch loop. Called once on daemon boot. */
+  startDispatchLoop() {
+    if (this.dispatchTimer) return;
+    this.dispatchTimer = setInterval(() => this.tick(), DISPATCH_INTERVAL_MS);
+  }
+
+  stopDispatchLoop() {
+    if (this.dispatchTimer) {
+      clearInterval(this.dispatchTimer);
+      this.dispatchTimer = null;
+    }
+  }
+
+  /** One dispatch tick: find pending jobs whose deps are met, dispatch up to concurrency limit. */
+  private async tick() {
+    const running = [...this.jobs.values()].filter((j) => j.state === "running").length;
+    const slots = MAX_CONCURRENT - running;
+    if (slots <= 0) return;
+
+    const eligible = [...this.jobs.values()]
+      .filter((j) => j.state === "pending" && this.depsCleared(j))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+
+    for (const job of eligible.slice(0, slots)) {
+      await this.dispatch(job.id);
+    }
+  }
+
+  private depsCleared(job: Job): boolean {
+    if (!job.deps || job.deps.length === 0) return true;
+    return job.deps.every((depId) => {
+      const dep = this.jobs.get(depId);
+      return dep && dep.state === "done";
+    });
+  }
+
+  /** Dispatch a pending job: create session, subscribe to events, fire prompt. */
+  private async dispatch(id: string) {
+    const job = this.jobs.get(id);
+    if (!job) return;
+    log.info("dispatch", { id, task: firstLine(job.task, 60) });
+    try {
+      const session = await this.client.createSession(firstLine(job.task, 60));
+      this.mergeJob(id, { sessionId: session.id });
+
+      const hub = new JobEventHub();
+      this.hubs.set(id, hub);
+
+      const unsub = this.bridge.subscribe(session.id, (events, raw) => {
+        for (const ev of events) this.handleEvent(id, ev, raw.type);
+        this.handleRaw(id, raw.type);
+      });
+      this.unsubscribers.set(id, unsub);
+
+      await this.client.promptAsync(session.id, job.task);
+      this.setState(id, "running");
+    } catch (e) {
+      log.error("dispatch failed", { id, err: String(e) });
+      this.mergeJob(id, { state: "error", error: String(e), updatedAt: new Date().toISOString() });
+    }
+  }
 
   list(): Job[] {
     return [...this.jobs.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
@@ -34,38 +103,66 @@ export class JobManager {
     return this.hubs.get(id);
   }
 
+  /** Create a single job and dispatch it immediately (the original h2 delegate path). */
   async create(task: string): Promise<Job> {
-    const session = await this.client.createSession(firstLine(task, 60));
     const job: Job = {
       id: jobId(),
       task,
-      sessionId: session.id,
+      sessionId: "", // filled by dispatch
       state: "pending",
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
     this.jobs.set(job.id, job);
-    const hub = new JobEventHub();
-    this.hubs.set(job.id, hub);
-
-    const unsub = this.bridge.subscribe(session.id, (events, raw) => {
-      for (const ev of events) this.handleEvent(job.id, ev, raw.type);
-      // Always let the job handler see the raw type, even when no Event was
-      // translated — done detection keys off rawType="session.idle".
-      this.handleRaw(job.id, raw.type);
-    });
-    this.unsubscribers.set(job.id, unsub);
-
-    try {
-      await this.client.promptAsync(session.id, task);
-      this.setState(job.id, "running");
-    } catch (e) {
-      log.error("jobs: prompt_async failed", { err: String(e) });
-      this.mergeJob(job.id, { state: "error", error: String(e), updatedAt: new Date().toISOString() });
-      hub.publish({ type: "status", state: "error" });
-      hub.publish({ type: "job.error", error: String(e) });
-    }
+    await this.dispatch(job.id);
     return this.jobs.get(job.id)!;
+  }
+
+  /** Create a plan: N jobs with optional dependency edges. Jobs start in "pending"
+   *  and the dispatch loop picks them up as deps clear. */
+  createPlan(tasks: Array<{ task: string; deps?: string[] }>): Plan {
+    const planId = "plan_" + crypto.randomUUID().replaceAll("-", "").slice(0, 12);
+    // First pass: create all jobs so we can map local indices to job IDs.
+    const localIds: string[] = [];
+    for (const t of tasks) {
+      const id = jobId();
+      localIds.push(id);
+      const job: Job = {
+        id,
+        task: t.task,
+        sessionId: "",
+        state: "pending",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        planId,
+      };
+      this.jobs.set(id, job);
+    }
+    // Second pass: wire up deps. Deps reference indices (0-based) into the tasks array.
+    for (let i = 0; i < tasks.length; i++) {
+      const depIndices = tasks[i].deps ?? [];
+      const depIds = depIndices
+        .map((d) => {
+          const idx = typeof d === "number" ? d : parseInt(d, 10);
+          return isNaN(idx) ? d : localIds[idx]; // support both index and raw job id
+        })
+        .filter(Boolean) as string[];
+      if (depIds.length > 0) {
+        this.mergeJob(localIds[i], { deps: depIds });
+      }
+    }
+    const plan: Plan = { id: planId, jobIds: localIds, createdAt: new Date().toISOString() };
+    this.plans.set(planId, plan);
+    log.info("plan created", { planId, count: tasks.length });
+    return plan;
+  }
+
+  getPlan(id: string): Plan | undefined {
+    return this.plans.get(id);
+  }
+
+  listPlans(): Plan[] {
+    return [...this.plans.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
   private handleEvent(jobId: string, ev: Event, _rawType: string) {
@@ -116,6 +213,7 @@ export class JobManager {
         this.mergeJob(jobId, { state, updatedAt: new Date().toISOString(), error: ev.error });
         hub.publish({ type: "status", state });
         hub.publish(ev);
+        appendHistory(this.jobs.get(jobId)!);
         // Do NOT teardown. Error is a state, not a grave — the user may
         // resume the session via `h2 send`, and we need to keep listening
         // for subsequent opencode events (session.idle, new parts, etc.).
@@ -132,16 +230,31 @@ export class JobManager {
   }
 
   /** Called for every raw opencode event on the subscribed session, after
-   *  translated events have been handled. This is where we detect job
-   *  completion: opencode fires `session.idle` once the model is done and no
-   *  tools are outstanding.
+   *  translated events have been handled. Handles two transitions:
+   *  1. session.idle → mark job done (if running)
+   *  2. session.status busy → re-activate a finished/errored job (user continued in TUI)
    */
   private handleRaw(jobId: string, rawType: string) {
-    if (rawType !== "session.idle") return;
     const j = this.jobs.get(jobId);
     if (!j) return;
-    if (j.state !== "running") return;
     const hub = this.hubs.get(jobId);
+
+    // Re-activate: if we see activity on a terminal job, the user continued
+    // the session outside of h2. Flip back to running.
+    if (rawType === "session.status") {
+      if ((j.state === "done" || j.state === "error" || j.state === "stopped") && hub) {
+        // We can't easily inspect the status payload here (it was already
+        // consumed by translate), but any session.status on a terminal job
+        // means opencode is doing something. Mark running.
+        this.mergeJob(jobId, { state: "running", error: undefined, updatedAt: new Date().toISOString() });
+        hub.publish({ type: "status", state: "running" });
+        log.info("job re-activated by session activity", { jobId });
+      }
+      return;
+    }
+
+    if (rawType !== "session.idle") return;
+    if (j.state !== "running") return;
     if (!hub) return;
     const finalOutput = this.finalBuffers.get(jobId) ?? "";
     this.mergeJob(jobId, {
@@ -151,7 +264,9 @@ export class JobManager {
     });
     hub.publish({ type: "status", state: "done" });
     hub.publish({ type: "job.done", summary: firstLine(finalOutput, 120) });
-    this.teardown(jobId);
+    appendHistory(this.jobs.get(jobId)!, firstLine(finalOutput, 200));
+    // Do NOT teardown — user may continue the session via opencode TUI/web,
+    // and we want to stay subscribed so the job re-activates.
   }
 
   private partBuffers = new Map<string, Map<string, string>>();
@@ -179,10 +294,7 @@ export class JobManager {
   async sendMessage(id: string, content: string): Promise<void> {
     const j = this.jobs.get(id);
     if (!j) throw new Error("no such job");
-    if (j.state === "done") {
-      throw new Error("job already done");
-    }
-    // Allow send on error/stopped — this is the "nudge it back to life" path.
+    // Allow send on ANY state — done/error/stopped all re-activate the session.
     // Re-subscribe if we previously tore down (e.g. abort).
     if (!this.unsubscribers.has(id)) {
       const unsub = this.bridge.subscribe(j.sessionId, (events, raw) => {

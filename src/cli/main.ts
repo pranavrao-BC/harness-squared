@@ -11,6 +11,9 @@ import { cmdApprove, cmdDeny } from "./commands/approve.ts";
 import { cmdAbort } from "./commands/abort.ts";
 import { cmdTail } from "./commands/tail.ts";
 import { cmdWait } from "./commands/wait.ts";
+import { cmdPlan } from "./commands/plan.ts";
+import { cmdBoard } from "./commands/board.ts";
+import { cmdHistory } from "./commands/history.ts";
 import { IpcError } from "./ipc.ts";
 import { main as daemonMain } from "../daemon/main.ts";
 
@@ -24,6 +27,9 @@ Daemon:
 
 Jobs:
   delegate <task>            create a job; prints its id
+  plan <json>                create a plan: multiple tasks with deps (or pipe JSON)
+  board                      kanban view of all jobs
+  history [N]                past jobs (survives daemon restarts)
   jobs                       list jobs
   status <id>                show job state + pending permissions
   output <id>                session log (only after done/error/stopped)
@@ -57,7 +63,13 @@ async function main(argv: string[]): Promise<number> {
   }
   switch (cmd) {
     case "__daemon":
-      await daemonMain();
+      try {
+        await daemonMain();
+      } catch (e) {
+        console.error(`daemon error: ${e}`);
+        if ((e as Error).stack) console.error((e as Error).stack);
+        return 1;
+      }
       return 0;
     case "start":
       return await cmdStart();
@@ -65,6 +77,12 @@ async function main(argv: string[]): Promise<number> {
       return await cmdStop();
     case "delegate":
       return await cmdDelegate(rest);
+    case "plan":
+      return await cmdPlan(rest);
+    case "board":
+      return await cmdBoard(rest);
+    case "history":
+      return await cmdHistory(rest);
     case "jobs":
       return await cmdJobs(rest);
     case "status":

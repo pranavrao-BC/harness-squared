@@ -33,6 +33,14 @@ export type Job = {
   updatedAt: string;
   finalOutput?: string; // populated on state=done
   error?: string; // populated on state=error
+  planId?: string; // if part of a plan
+  deps?: string[]; // job ids that must complete before this can dispatch
+};
+
+export type Plan = {
+  id: string; // "plan_" + 12 hex chars
+  jobIds: string[];
+  createdAt: string;
 };
 
 /**
