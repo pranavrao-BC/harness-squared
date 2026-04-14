@@ -35,6 +35,12 @@ export class JobEventHub {
     return () => this.subscribers.delete(fn);
   }
 
+  /** Clear the replay buffer. Called when a job re-activates so stale
+   *  terminal events don't trick new wait subscribers. */
+  clearBuffer() {
+    this.buffer = [];
+  }
+
   close() {
     this.closed = true;
     this.subscribers.clear();

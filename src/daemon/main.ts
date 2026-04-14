@@ -92,6 +92,11 @@ export async function main() {
   await server.finished;
 }
 
-if (import.meta.main) {
+// Only auto-boot when run directly (deno run src/daemon/main.ts), not when
+// imported by the CLI binary. In compiled binaries, import.meta.main is only
+// true for the actual entrypoint (cli/main.ts), not imported modules.
+const isDirectRun = import.meta.main &&
+  new URL(import.meta.url).pathname.endsWith("daemon/main.ts");
+if (isDirectRun) {
   await main();
 }

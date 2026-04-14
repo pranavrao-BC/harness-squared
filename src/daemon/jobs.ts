@@ -246,6 +246,7 @@ export class JobManager {
         // We can't easily inspect the status payload here (it was already
         // consumed by translate), but any session.status on a terminal job
         // means opencode is doing something. Mark running.
+        hub.clearBuffer(); // Flush stale terminal events so new wait() calls don't see old "done"
         this.mergeJob(jobId, { state: "running", error: undefined, updatedAt: new Date().toISOString() });
         hub.publish({ type: "status", state: "running" });
         log.info("job re-activated by session activity", { jobId });
@@ -304,7 +305,8 @@ export class JobManager {
       this.unsubscribers.set(id, unsub);
     }
     await this.client.promptAsync(j.sessionId, content);
-    this.mergeJob(id, { error: undefined }); // clear old error
+    this.hubs.get(id)?.clearBuffer(); // Flush stale events for clean wait()
+    this.mergeJob(id, { error: undefined });
     this.setState(id, "running");
   }
 

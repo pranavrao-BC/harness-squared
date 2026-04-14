@@ -14,6 +14,7 @@ import { cmdWait } from "./commands/wait.ts";
 import { cmdPlan } from "./commands/plan.ts";
 import { cmdBoard } from "./commands/board.ts";
 import { cmdHistory } from "./commands/history.ts";
+import { cmdExec } from "./commands/exec.ts";
 import { IpcError } from "./ipc.ts";
 import { main as daemonMain } from "../daemon/main.ts";
 
@@ -25,8 +26,9 @@ Daemon:
   start                      start the daemon and opencode serve (idempotent)
   stop                       stop the daemon
 
-Jobs:
-  delegate <task>            create a job; prints its id
+Orchestration:
+  exec <script>              run JS with the h2 API (or pipe via stdin)
+  delegate <task>            create a single job; prints its id
   plan <json>                create a plan: multiple tasks with deps (or pipe JSON)
   board                      kanban view of all jobs
   history [N]                past jobs (survives daemon restarts)
@@ -75,6 +77,8 @@ async function main(argv: string[]): Promise<number> {
       return await cmdStart();
     case "stop":
       return await cmdStop();
+    case "exec":
+      return await cmdExec(rest);
     case "delegate":
       return await cmdDelegate(rest);
     case "plan":
