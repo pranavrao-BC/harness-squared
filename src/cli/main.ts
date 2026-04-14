@@ -15,6 +15,7 @@ import { cmdPlan } from "./commands/plan.ts";
 import { cmdBoard } from "./commands/board.ts";
 import { cmdHistory } from "./commands/history.ts";
 import { cmdExec } from "./commands/exec.ts";
+import { cmdConfig } from "./commands/config.ts";
 import { IpcError } from "./ipc.ts";
 import { main as daemonMain } from "../daemon/main.ts";
 
@@ -25,10 +26,12 @@ Usage: h2 <command> [...]
 Daemon:
   start                      start the daemon and executor backends (idempotent)
   stop                       stop the daemon
+  config                     print the resolved configuration for the daemon
 
 Orchestration:
   exec <script>              run JS with the h2 API (or pipe via stdin)
-  delegate <task>            create a single job; prints its id
+  delegate [--executor X] [--model X] <task>
+                               create a single job; prints its id
   plan <json>                create a plan: multiple tasks with deps (or pipe JSON)
   board                      kanban view of all jobs
   history [N]                past jobs (survives daemon restarts)
@@ -77,6 +80,8 @@ async function main(argv: string[]): Promise<number> {
       return await cmdStart();
     case "stop":
       return await cmdStop();
+    case "config":
+      return await cmdConfig(rest);
     case "exec":
       return await cmdExec(rest);
     case "delegate":
