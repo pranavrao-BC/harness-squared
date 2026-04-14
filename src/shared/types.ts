@@ -39,6 +39,8 @@ export type Job = {
   error?: string; // populated on state=error
   planId?: string; // if part of a plan
   deps?: string[]; // job ids that must complete before this can dispatch
+  retryCount?: number;
+  maxRetries?: number;
 };
 
 export type Plan = {
@@ -126,10 +128,12 @@ export type Config = {
       args: string[];
       model?: string;
       agent?: string;
+      yolo?: boolean;
     }
   >;
   permissionsDefault: "wait" | "deny" | "allow";
   permissionsTimeout: number; // seconds; 0 = none
+  maxRetries?: number;
   dataDir: string; // ~/.harness-squared
   logPath: string;
   pidPath: string;

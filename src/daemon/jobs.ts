@@ -129,6 +129,8 @@ export class JobManager {
       state: "pending",
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
+      maxRetries: this.config.maxRetries ?? 1,
+      retryCount: 0,
     };
     this.jobs.set(job.id, job);
     await this.dispatch(job.id);
@@ -153,6 +155,8 @@ export class JobManager {
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         planId,
+        maxRetries: this.config.maxRetries ?? 1,
+        retryCount: 0,
       };
       this.jobs.set(id, job);
     }
@@ -218,6 +222,20 @@ export class JobManager {
         hub.publish(ev);
         return;
       case "job.error": {
+        const job = this.jobs.get(jobId);
+        if (job && (job.retryCount ?? 0) < (job.maxRetries ?? 0)) {
+          const attempt = (job.retryCount ?? 0) + 1;
+          log.info("retrying job", { jobId, attempt, maxRetries: job.maxRetries });
+          const delayMs = Math.pow(2, attempt) * 1000;
+          hub?.publish({ type: "log", text: "retrying (attempt " + attempt + "/" + job.maxRetries + ") after " + (delayMs / 1000) + "s" });
+          this.mergeJob(jobId, { retryCount: attempt, state: "pending", updatedAt: new Date().toISOString() });
+          this.teardown(jobId);
+          this.finalBuffers.delete(jobId);
+          this.partBuffers.delete(jobId);
+          this.hubs.delete(jobId);
+          setTimeout(() => this.dispatch(jobId), delayMs);
+          return;
+        }
         const state: JobState = "error";
         this.mergeJob(jobId, { state, updatedAt: new Date().toISOString(), error: ev.error });
         hub.publish({ type: "status", state });

@@ -19,6 +19,7 @@ export async function createAdapters(
       args: ec.args,
       model: ec.model,
       agent: ec.agent,
+      yolo: ec.yolo,
     };
 
     const adapter = buildAdapter(name, executorConfig);

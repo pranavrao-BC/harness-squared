@@ -17,10 +17,15 @@ import { log } from "../../../shared/log.ts";
 
 type SessionSub = { handler: ExecutorEventHandler };
 
+type PendingPerm = { approved: boolean };
+
 type SessionState = {
   child: Deno.ChildProcess;
   subs: Set<SessionSub>;
   output: string;
+  stdinWriter?: WritableStreamDefaultWriter<Uint8Array>;
+  yolo: boolean;
+  pendingPerms: Map<string, PendingPerm>;
 };
 
 export class GeminiAdapter implements ExecutorAdapter {
@@ -56,8 +61,9 @@ export class GeminiAdapter implements ExecutorAdapter {
   }
 
   async prompt(sessionId: string, text: string, opts?: PromptOptions): Promise<void> {
+    const yolo = opts?.yolo ?? this.config.yolo ?? true;
     const args = [
-      "--yolo",
+      ...(yolo ? ["--yolo"] : []),
       "--output-format", "stream-json",
       ...this.config.args,
     ];
@@ -66,7 +72,7 @@ export class GeminiAdapter implements ExecutorAdapter {
       args.push("-m", model);
     }
     const workDir = opts?.cwd ?? Deno.cwd();
-    log.info("gemini: spawning headless", { sessionId, model, cwd: workDir });
+    log.info("gemini: spawning headless", { sessionId, model, cwd: workDir, yolo });
     const cmd = new Deno.Command(this.config.bin, {
       args,
       cwd: workDir,
@@ -79,12 +85,17 @@ export class GeminiAdapter implements ExecutorAdapter {
 
     const writer = child.stdin.getWriter();
     await writer.write(new TextEncoder().encode(text));
-    await writer.close();
+    if (yolo) {
+      await writer.close();
+    }
 
     const state: SessionState = {
       child,
       subs: this.sessions.get(sessionId)?.subs ?? new Set(),
       output: "",
+      stdinWriter: yolo ? undefined : writer,
+      yolo,
+      pendingPerms: new Map(),
     };
     this.sessions.set(sessionId, state);
 
@@ -99,11 +110,21 @@ export class GeminiAdapter implements ExecutorAdapter {
   }
 
   async respondPermission(
-    _sessionId: string,
-    _permId: string,
-    _response: PermissionResponse,
+    sessionId: string,
+    permId: string,
+    response: PermissionResponse,
   ): Promise<void> {
-    // --yolo mode auto-approves everything, no permission flow needed
+    const state = this.sessions.get(sessionId);
+    if (!state || !state.stdinWriter) return;
+    const perm = state.pendingPerms.get(permId);
+    if (!perm) {
+      log.warn("gemini: respondPermission for unknown perm", { sessionId, permId });
+      return;
+    }
+    const answer = response === "reject" ? "n\n" : "y\n";
+    await state.stdinWriter.write(new TextEncoder().encode(answer));
+    perm.approved = response !== "reject";
+    log.info("gemini: permission response sent", { sessionId, permId, response });
   }
 
   async abort(sessionId: string): Promise<void> {
@@ -125,7 +146,7 @@ export class GeminiAdapter implements ExecutorAdapter {
       const sub: SessionSub = { handler };
       const subs = new Set<SessionSub>([sub]);
       // Store just the subs for now; process will use them when spawned
-      this.sessions.set(sessionId, { child: null!, subs, output: "" });
+      this.sessions.set(sessionId, { child: null!, subs, output: "", yolo: true, pendingPerms: new Map() });
       return () => subs.delete(sub);
     }
     const sub: SessionSub = { handler };
@@ -237,6 +258,22 @@ export class GeminiAdapter implements ExecutorAdapter {
           callId,
           input: obj.args ?? obj.input,
         }], "session/update");
+        if (state && !state.yolo) {
+          const permId = "gperm_" + crypto.randomUUID().slice(0, 8);
+          state.pendingPerms.set(permId, { approved: false });
+          this.emit(sessionId, [{
+            type: "permission.request",
+            request: {
+              id: permId,
+              jobId: "",
+              permission: name,
+              patterns: [],
+              description: name + ": " + JSON.stringify(obj.args ?? obj.input ?? {}).slice(0, 200),
+              createdAt: new Date().toISOString(),
+              resolved: false,
+            },
+          }], "session/update");
+        }
         break;
       }
       case "tool_call_result": {

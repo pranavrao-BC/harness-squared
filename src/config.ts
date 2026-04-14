@@ -10,6 +10,7 @@ type ExecutorToml = {
   args?: string[];
   model?: string;
   agent?: string;
+  yolo?: boolean;
 };
 
 type TomlShape = {
@@ -45,6 +46,7 @@ export async function loadConfig(): Promise<Config> {
         args: ec.args ?? [],
         model: ec.model,
         agent: ec.agent,
+        yolo: ec.yolo,
       };
     }
   } else {
@@ -56,6 +58,7 @@ export async function loadConfig(): Promise<Config> {
         args: oc.args ?? [],
         model: oc.model,
         agent: oc.agent,
+        yolo: oc.yolo,
       };
     }
     if (parsed.gemini) {
@@ -66,6 +69,7 @@ export async function loadConfig(): Promise<Config> {
         args: gc.args ?? [],
         model: gc.model,
         agent: gc.agent,
+        yolo: gc.yolo,
       };
     }
   }
@@ -76,6 +80,7 @@ export async function loadConfig(): Promise<Config> {
     executors,
     permissionsDefault: parsed.permissions?.default ?? "wait",
     permissionsTimeout: parsed.permissions?.timeout ?? 0,
+    maxRetries: (parsed as Record<string, unknown>).maxRetries as number | undefined ?? 1,
     dataDir: dir,
     logPath: logPath(),
     pidPath: pidPath(),

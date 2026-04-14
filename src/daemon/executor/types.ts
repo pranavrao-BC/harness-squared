@@ -48,6 +48,7 @@ export type ExecutorConfig = {
   readonly args: readonly string[];
   readonly model?: string;
   readonly agent?: string;
+  readonly yolo?: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -59,6 +60,8 @@ export type PromptOptions = {
   readonly cwd?: string;
   /** Override the model for this prompt. Falls back to executor config default. */
   readonly model?: string;
+  /** Override yolo mode for this prompt. Falls back to executor config default (true). */
+  readonly yolo?: boolean;
 };
 
 // ---------------------------------------------------------------------------
