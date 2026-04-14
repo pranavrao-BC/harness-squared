@@ -1,14 +1,6 @@
 # harness²
 
-A harness for harnesses. Claude Code drives opencode via a small Deno daemon,
-so Opus can plan and delegate mechanical work to cheaper executors (GLM,
-Gemini Flash) while the user observes and gates permissions.
-
-**Status:** v0.1 exploratory prototype. See [DESIGN.md](./DESIGN.md) for the
-full spec and [§14](./DESIGN.md#14-success-criteria-for-v01) for what "working"
-means.
-
-## The idea
+A harness for harnesses. Claude Code (Opus) delegates mechanical coding tasks to opencode (GLM, Gemini Flash, etc.) through a small Deno daemon, while you observe and gate permissions in a separate pane.
 
 ```
 Claude Code (Opus)  ──h2 delegate──▶  h2 daemon  ──HTTP──▶  opencode serve  ──▶  GLM / Gemini / …
@@ -18,78 +10,135 @@ Claude Code (Opus)  ──h2 delegate──▶  h2 daemon  ──HTTP──▶  
                                        you (tmux)
 ```
 
-- Claude Code (supervisor) calls `h2 delegate "..."` via its `Bash` tool.
-- The daemon owns an `opencode serve` child and routes tasks as opencode sessions.
-- You watch and guide via `h2 tail <id>` in another tmux pane.
-- Permission prompts from opencode bubble up to your tail pane for approval.
+**Status:** v0.1 working prototype.
 
-## Quick start
+## Prerequisites
 
-Install prereqs:
+- [Deno 2.x](https://deno.com/) — `brew install deno` or see deno.com
+- [opencode](https://opencode.ai/) — installed and authenticated (`opencode providers login`)
 
-- [Deno 2.x](https://deno.com/) on `PATH`
-- [opencode](https://opencode.ai/) authenticated for at least one provider
-  (`opencode providers login`)
-
-Run from source (no install step):
+## Install
 
 ```bash
-deno task cli start                 # launch daemon + opencode serve
-deno task cli delegate "add '// Copyright 2026' as the first line of /tmp/foo.ts"
-deno task cli tail <job-id>         # in another pane: watch events, approve perms
-deno task cli output <job-id>       # once state=done
-deno task cli stop
+git clone https://github.com/AudienseCo/harness-squared.git
+cd harness-squared
+./scripts/install.sh    # compiles h2 → ~/.local/bin/h2
 ```
 
-Or compile and install `h2` into `~/.local/bin`:
+Make sure `~/.local/bin` is on your PATH.
+
+## Setup (one-time)
+
+**1. Configure your model** (optional — defaults to whatever opencode uses):
 
 ```bash
-./scripts/install.sh
+mkdir -p ~/.config/harness-squared
+cat > ~/.config/harness-squared/config.toml << 'EOF'
+[opencode]
+model = "zai-coding-plan/glm-5.1"
+EOF
+```
+
+**2. Tell Claude Code about h2:**
+
+```bash
+cat examples/claude_instructions.md >> ~/.claude/CLAUDE.md
+```
+
+Edit `~/.claude/CLAUDE.md` afterward — remove the preamble lines, keep the `## Delegating via harness²` section.
+
+## Usage
+
+**Three panes** (tmux, WezTerm splits, whatever):
+
+### Pane 1: Start the daemon
+
+```bash
 h2 start
-h2 delegate "..."
 ```
+
+This launches the h2 daemon + an `opencode serve` child. Idempotent — run it again to check if it's up.
+
+### Pane 2: Claude Code
+
+```bash
+claude    # or open Claude Code however you prefer
+```
+
+Ask Claude to do mechanical work. It will call `h2 delegate "..."` via Bash, then `h2 wait <id>` to block until done, then `h2 output <id>` to read the result. You approve Claude Code's Bash permission prompt as usual.
+
+### Pane 3: Watch the delegation
+
+```bash
+h2 tail <job-id>    # job id shown in Claude's pane
+```
+
+You'll see tool calls stream past. When a permission prompt appears (e.g. "edit src/foo.ts"), press `y` to allow once, `a` to always allow, or `n` to reject.
+
+Alternatively, open the opencode web UI at `http://127.0.0.1:<port>` (port is in `~/.harness-squared/pids.json`) or attach the opencode TUI:
+
+```bash
+opencode attach http://127.0.0.1:$(cat ~/.harness-squared/pids.json | grep opencodePort | grep -o '[0-9]*')
+```
+
+### When you're done
+
+```bash
+h2 stop
+```
+
+## CLI reference
+
+| Command | What it does |
+|---|---|
+| `h2 start` | Start daemon + opencode (idempotent) |
+| `h2 stop` | Shut everything down |
+| `h2 delegate "<task>"` | Create a job, print its id |
+| `h2 wait <id>` | Block until job finishes |
+| `h2 output <id>` | Print session log (user msgs, tools, errors, result) |
+| `h2 output <id> --full` | Verbose session log with tool inputs/outputs |
+| `h2 status <id>` | Quick state check + pending permissions |
+| `h2 tail <id>` | Live event stream with interactive permission prompts |
+| `h2 send <id> "<msg>"` | Inject guidance mid-run, or resume an errored job |
+| `h2 abort <id>` | Kill a running job |
+| `h2 approve <id> <perm>` | Allow a pending permission (from any pane) |
+| `h2 deny <id> <perm>` | Reject a pending permission |
+| `h2 jobs` | List all jobs |
+
+## How it works
+
+1. `h2 delegate` creates an opencode session and fires a `prompt_async` with your task.
+2. The daemon subscribes to opencode's SSE event stream and translates events (tool calls, permissions, completion) into h2's internal event model.
+3. `h2 tail` and `h2 wait` subscribe to the daemon's per-job SSE stream over a unix socket.
+4. Permission requests from opencode bubble up to whoever is tailing. Approvals flow back through the daemon to opencode.
+5. When opencode fires `session.idle`, the daemon marks the job done and captures the final output.
+6. `h2 output` fetches the full message history from opencode and renders a condensed conversation log.
+
+## Tips
+
+- **Use absolute paths** in task descriptions. The opencode session inherits the daemon's cwd, not Claude's.
+- **If a job errors or hangs**, `h2 send <id> "continue"` resumes it. The subscription stays alive across errors.
+- **Claude won't poll** — `h2 wait` blocks. If you see Claude polling `h2 status` in a loop, tell it to use `h2 wait` instead.
+- **View the opencode TUI** for a richer view: `opencode attach http://127.0.0.1:<port>`.
 
 ## Configuration
 
-Optional: `~/.config/harness-squared/config.toml`.
+`~/.config/harness-squared/config.toml` (all fields optional):
 
 ```toml
 [opencode]
-model = "zai-coding-plan/glm-5.1"
+# model = "zai-coding-plan/glm-5.1"   # provider/model to use per-session
+# bin = "opencode"                      # path to opencode binary
+# args = []                             # extra args to opencode serve
 
 [permissions]
-default = "wait"
+# default = "wait"     # what happens when nobody is tailing: "wait", "deny", or "allow"
+# timeout = 300        # seconds before auto-deny (only for default="deny")
+
+[daemon]
+# socket = "~/.harness-squared/daemon.sock"
 ```
 
-See [DESIGN.md §10](./DESIGN.md#10-config) for all options.
+## Design
 
-## Claude-side hookup
-
-The daemon is invoked by Claude Code through the normal `Bash` tool, gated by
-Claude's usual permission prompt. A suggested CLAUDE.md snippet lives in
-[examples/claude_instructions.md](./examples/claude_instructions.md) — read it,
-edit it for your workflow, paste it into `~/.claude/CLAUDE.md`.
-
-## Layout
-
-```
-src/
-  cli/         # `h2` CLI — thin, all commands talk to the daemon over a unix socket
-  daemon/      # `h2 daemon` — owns opencode serve, jobs, permissions, event fan-out
-  shared/      # types, paths, logging, SSE parser
-```
-
-Entry points: `src/cli/main.ts`, `src/daemon/main.ts`.
-
-## Non-goals (v0.1)
-
-No cost tracking, no parallel jobs, no executor profiles, no persistence, no
-TUI, no auth. See [DESIGN.md §2](./DESIGN.md#2-non-goals-for-this-exploration).
-
-## Known gaps
-
-- Sessions inherit the daemon's cwd; there's no per-delegation working
-  directory override yet. Put absolute paths in your task text for now.
-- No graceful daemon restart — if the daemon dies, in-flight jobs are lost.
-- `h2 tail` uses a blocking `stdin.read` for the permission prompt, so it
-  only handles one prompt at a time. That's fine for exploratory use.
+See [DESIGN.md](./DESIGN.md) for the full spec, architecture, and open questions.
