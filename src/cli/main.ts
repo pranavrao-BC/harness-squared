@@ -10,7 +10,9 @@ import { cmdSend } from "./commands/send.ts";
 import { cmdApprove, cmdDeny } from "./commands/approve.ts";
 import { cmdAbort } from "./commands/abort.ts";
 import { cmdTail } from "./commands/tail.ts";
+import { cmdWait } from "./commands/wait.ts";
 import { IpcError } from "./ipc.ts";
+import { main as daemonMain } from "../daemon/main.ts";
 
 const USAGE = `harness² (h2) — dispatch tasks from Claude Code to opencode.
 
@@ -24,7 +26,8 @@ Jobs:
   delegate <task>            create a job; prints its id
   jobs                       list jobs
   status <id>                show job state + pending permissions
-  output <id>                final assistant text (only when state=done)
+  output <id>                session log (only after done/error/stopped)
+  wait <id>                  block until job finishes, then print result
   send <id> <message>        inject a user message into a live session
   abort <id>                 stop a job
 
@@ -53,12 +56,9 @@ async function main(argv: string[]): Promise<number> {
     return cmd ? 0 : 2;
   }
   switch (cmd) {
-    case "__daemon": {
-      // Hidden: the compiled binary uses this to re-exec itself as the daemon.
-      const { main: daemonMain } = await import("../daemon/main.ts");
+    case "__daemon":
       await daemonMain();
       return 0;
-    }
     case "start":
       return await cmdStart();
     case "stop":
@@ -79,6 +79,8 @@ async function main(argv: string[]): Promise<number> {
       return await cmdDeny(rest);
     case "abort":
       return await cmdAbort(rest);
+    case "wait":
+      return await cmdWait(rest);
     case "tail":
       return await cmdTail(rest);
     default:

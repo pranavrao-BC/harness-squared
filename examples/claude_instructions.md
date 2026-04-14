@@ -12,14 +12,15 @@ tests, refactors, format conversions, repetitive edits across files — delegate
 to the h2 daemon rather than writing the code yourself. Use the Bash tool:
 
 - `h2 delegate "<task with exact paths and constraints>"` — returns a job id.
-- `h2 status <id>` — check state (running/done/error) and pending permissions.
-- `h2 output <id>` — fetch the final assistant text once state=done.
+- `h2 wait <id>` — **blocks** until the job finishes, then prints the result. Use this after delegate instead of polling status.
+- `h2 output <id>` — full session log (user messages, tool calls, errors, final text). Read this to understand what happened.
+- `h2 status <id>` — quick check of state + pending permissions (use sparingly, prefer wait).
 - `h2 abort <id>` — kill a job that's going off the rails.
-- `h2 send <id> "<guidance>"` — inject a user message mid-run.
+- `h2 send <id> "<guidance>"` — inject a user message mid-run, or resume an errored/stopped job.
 
-Between `delegate` and `status`, do something else useful or wait briefly
-before polling. The user watches the job in another tmux pane with
-`h2 tail <id>` and will approve permission prompts or steer as needed.
+After `delegate`, call `h2 wait <id>`. It blocks — do NOT poll `h2 status` in
+a loop. The user watches the job in another tmux pane with `h2 tail <id>` and
+will approve permission prompts or steer as needed.
 
 Write **specific** task descriptions: absolute paths, explicit constraints,
 what NOT to change, what "done" looks like. Vague tasks produce vague diffs.

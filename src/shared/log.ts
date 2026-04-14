@@ -25,6 +25,18 @@ function safeJson(v: unknown): string {
   }
 }
 
+/**
+ * Leveled logger for the h2 daemon.
+ *
+ * Writes structured log lines to stderr. The minimum log level is controlled
+ * by the `H2_LOG_LEVEL` environment variable (defaults to `"info"`).
+ * Each method formats its output as `<timestamp> <LEVEL> <msg> [extra]`.
+ *
+ * @property debug - Logs at debug level (lowest priority).
+ * @property info - Logs at info level.
+ * @property warn - Logs at warn level.
+ * @property error - Logs at error level (highest priority).
+ */
 export const log = {
   debug: (msg: string, extra?: unknown) => emit("debug", msg, extra),
   info: (msg: string, extra?: unknown) => emit("info", msg, extra),
