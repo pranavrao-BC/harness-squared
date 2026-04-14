@@ -10,6 +10,7 @@ import type {
   ExecutorConfig,
   ExecutorEventHandler,
   NormalizedMessage,
+  PromptOptions,
 } from "../types.ts";
 import type { Event, PermissionRequest, PermissionResponse } from "../../../shared/types.ts";
 import { log } from "../../../shared/log.ts";
@@ -20,7 +21,6 @@ type SessionState = {
   child: Deno.ChildProcess;
   subs: Set<SessionSub>;
   output: string;
-  workDir: string;
 };
 
 export class GeminiAdapter implements ExecutorAdapter {
@@ -55,21 +55,21 @@ export class GeminiAdapter implements ExecutorAdapter {
     return sessionId;
   }
 
-  async prompt(sessionId: string, text: string): Promise<void> {
+  async prompt(sessionId: string, text: string, opts?: PromptOptions): Promise<void> {
     const args = [
       "--yolo",
       "--output-format", "stream-json",
       ...this.config.args,
     ];
-    if (this.config.model) {
-      args.push("-m", this.config.model);
+    const model = opts?.model ?? this.config.model;
+    if (model) {
+      args.push("-m", model);
     }
     // -p must be last — everything after it is the prompt text
     args.push("-p", text);
 
-    log.info("gemini: spawning headless", { sessionId, model: this.config.model });
-    const workDir = `/tmp/h2_gemini_${sessionId}`;
-    await Deno.mkdir(workDir, { recursive: true });
+    const workDir = opts?.cwd ?? Deno.cwd();
+    log.info("gemini: spawning headless", { sessionId, model, cwd: workDir });
     const cmd = new Deno.Command(this.config.bin, {
       args,
       cwd: workDir,
@@ -84,7 +84,6 @@ export class GeminiAdapter implements ExecutorAdapter {
       child,
       subs: this.sessions.get(sessionId)?.subs ?? new Set(),
       output: "",
-      workDir,
     };
     this.sessions.set(sessionId, state);
 
@@ -125,7 +124,7 @@ export class GeminiAdapter implements ExecutorAdapter {
       const sub: SessionSub = { handler };
       const subs = new Set<SessionSub>([sub]);
       // Store just the subs for now; process will use them when spawned
-      this.sessions.set(sessionId, { child: null!, subs, output: "", workDir: "" });
+      this.sessions.set(sessionId, { child: null!, subs, output: "" });
       return () => subs.delete(sub);
     }
     const sub: SessionSub = { handler };
@@ -182,11 +181,6 @@ export class GeminiAdapter implements ExecutorAdapter {
     } catch { /* */ }
 
     this.emit(sessionId, [], "gemini/done");
-
-    const s = this.sessions.get(sessionId);
-    if (s?.workDir) {
-      try { await Deno.remove(s.workDir, { recursive: true }); } catch { /* */ }
-    }
   }
 
   private handleStreamLine(sessionId: string, line: string) {

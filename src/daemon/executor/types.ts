@@ -51,6 +51,17 @@ export type ExecutorConfig = {
 };
 
 // ---------------------------------------------------------------------------
+// Prompt options — passed per-call through the adapter boundary
+// ---------------------------------------------------------------------------
+
+export type PromptOptions = {
+  /** Working directory for the executor process. Defaults to daemon cwd. */
+  readonly cwd?: string;
+  /** Override the model for this prompt. Falls back to executor config default. */
+  readonly model?: string;
+};
+
+// ---------------------------------------------------------------------------
 // ExecutorAdapter — the interface every backend must implement
 // ---------------------------------------------------------------------------
 
@@ -74,7 +85,7 @@ export interface ExecutorAdapter {
   createSession(title: string): Promise<string>;
 
   /** Fire-and-forget prompt into an existing session. */
-  prompt(sessionId: string, text: string): Promise<void>;
+  prompt(sessionId: string, text: string, opts?: PromptOptions): Promise<void>;
 
   /** Respond to a permission / tool-approval request. */
   respondPermission(

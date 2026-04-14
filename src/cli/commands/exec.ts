@@ -16,8 +16,8 @@ type HistoryEntry = {
   finishedAt: string;
 };
 
-type DelegateOpts = { executor?: string };
-type RunOpts = { executor?: string; full?: boolean };
+type DelegateOpts = { executor?: string; cwd?: string; model?: string };
+type RunOpts = { executor?: string; full?: boolean; cwd?: string; model?: string };
 
 function buildH2Api() {
   return {
@@ -26,7 +26,9 @@ function buildH2Api() {
 
     async delegate(task: string, opts?: DelegateOpts): Promise<string> {
       const body: Record<string, unknown> = { task: task + this.ESCALATE_INSTRUCTION };
+      body.cwd = opts?.cwd ?? Deno.cwd();
       if (opts?.executor) body.executor = opts.executor;
+      if (opts?.model) body.model = opts.model;
       const res = await ipcPost<{ id: string }>("/jobs", body);
       return res.id;
     },
@@ -82,7 +84,7 @@ function buildH2Api() {
 
     /** Delegate + wait + output in one shot. Convenience for simple tasks. */
     async run(task: string, opts?: RunOpts): Promise<string> {
-      const id = await this.delegate(task, { executor: opts?.executor });
+      const id = await this.delegate(task, { executor: opts?.executor, cwd: opts?.cwd, model: opts?.model });
       await this.wait(id);
       return await this.output(id, { full: opts?.full });
     },

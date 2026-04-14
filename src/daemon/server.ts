@@ -28,9 +28,9 @@ export function buildHandler(
         return json({ ok: true });
       }
       if (req.method === "POST" && path === "/jobs") {
-        const body = await readJson<{ task?: string; executor?: string }>(req);
+        const body = await readJson<{ task?: string; executor?: string; cwd?: string; model?: string }>(req);
         if (!body.task) return error(400, "task required");
-        const job = await jobs.create(body.task, body.executor);
+        const job = await jobs.create(body.task, body.executor, body.cwd, body.model);
         return json({ id: job.id, sessionId: job.sessionId, state: job.state, executor: job.executor });
       }
       if (req.method === "GET" && path === "/jobs") {

@@ -48,10 +48,11 @@ mkdir -p "$CONFIG_DIR"
 if [ -f "$CONFIG_FILE" ]; then
   echo "Config already exists at $CONFIG_FILE (not overwriting)"
 else
-  cat > "$CONFIG_FILE" <<'CONF'
+    cat > "$CONFIG_FILE" <<'CONF'
 executor = "opencode"
 
-[opencode]
+[executors.opencode]
+type = "opencode"
 model = "zai-coding-plan/glm-5.1"
 
 [permissions]

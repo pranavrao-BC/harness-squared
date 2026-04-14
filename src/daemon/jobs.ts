@@ -96,7 +96,7 @@ export class JobManager {
       });
       this.unsubscribers.set(id, unsub);
 
-      await adapter.prompt(sessionId, job.task);
+      await adapter.prompt(sessionId, job.task, { cwd: job.cwd, model: job.model });
       // State already set to "running" above; publish the status event for subscribers.
       this.hubs.get(id)?.publish({ type: "status", state: "running" });
     } catch (e) {
@@ -118,12 +118,14 @@ export class JobManager {
   }
 
   /** Create a single job and dispatch it immediately. */
-  async create(task: string, executor?: string): Promise<Job> {
+  async create(task: string, executor?: string, cwd?: string, model?: string): Promise<Job> {
     const job: Job = {
       id: jobId(),
       task,
       sessionId: "", // filled by dispatch
       executor: executor ?? this.config.defaultExecutor,
+      cwd,
+      model,
       state: "pending",
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -297,7 +299,7 @@ export class JobManager {
       });
       this.unsubscribers.set(id, unsub);
     }
-    await adapter.prompt(j.sessionId, content);
+    await adapter.prompt(j.sessionId, content, { cwd: j.cwd, model: j.model });
     this.hubs.get(id)?.clearBuffer();
     this.mergeJob(id, { error: undefined });
     this.setState(id, "running");

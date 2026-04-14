@@ -7,6 +7,7 @@ import type {
   ExecutorEventHandler,
   NormalizedMessage,
   NormalizedPart,
+  PromptOptions,
 } from "../types.ts";
 import type { PermissionResponse } from "../../../shared/types.ts";
 import { log } from "../../../shared/log.ts";
@@ -47,7 +48,7 @@ export class OpencodeAdapter implements ExecutorAdapter {
     return session.id;
   }
 
-  async prompt(sessionId: string, text: string): Promise<void> {
+  async prompt(sessionId: string, text: string, _opts?: PromptOptions): Promise<void> {
     await this.requireClient().promptAsync(sessionId, text);
   }
 

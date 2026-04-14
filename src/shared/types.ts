@@ -30,6 +30,8 @@ export type Job = {
   task: string; // verbatim task text
   sessionId: string; // opaque executor session id
   executor?: string; // executor backend name (e.g. "opencode", "gemini")
+  cwd?: string; // working directory for the executor process
+  model?: string; // model override for this job
   state: JobState;
   createdAt: string; // ISO 8601
   updatedAt: string;
