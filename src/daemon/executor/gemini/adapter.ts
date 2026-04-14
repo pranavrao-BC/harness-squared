@@ -65,20 +65,21 @@ export class GeminiAdapter implements ExecutorAdapter {
     if (model) {
       args.push("-m", model);
     }
-    // -p must be last — everything after it is the prompt text
-    args.push("-p", text);
-
     const workDir = opts?.cwd ?? Deno.cwd();
     log.info("gemini: spawning headless", { sessionId, model, cwd: workDir });
     const cmd = new Deno.Command(this.config.bin, {
       args,
       cwd: workDir,
-      stdin: "null",
+      stdin: "piped",
       stdout: "piped",
       stderr: "piped",
       env: { ...Deno.env.toObject() },
     });
     const child = cmd.spawn();
+
+    const writer = child.stdin.getWriter();
+    await writer.write(new TextEncoder().encode(text));
+    await writer.close();
 
     const state: SessionState = {
       child,
